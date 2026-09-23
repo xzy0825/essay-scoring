@@ -63,6 +63,8 @@ uv run python -m src.submit
 
 训练结果写在 `outputs/opt/`，不覆盖 `main` 那次的 `outputs/submission.csv`。
 
+这一支的留出折（第 0 折，没有参与选权重和阈值）四舍五入 QWK 是 **0.815**，按题目切分后是 **0.823**。五折整体四舍五入是 DeBERTa **0.812**、LightGBM **0.776**。校准折上 DeBERTa 的权重被选成 1.0，提交文件没有再混入 LightGBM。线上分数是 **0.821**，低于 `main` 的 **0.832**。`main` 仍是分数更高的那一版。1024 长度只碰到 112 篇作文的上限，大部分作文本来就短于 512，所以加长带来的折外提升没有留到线上。
+
 ```bash
 uv run python -m src.train_lgbm
 HF_ENDPOINT=https://hf-mirror.com uv run python -m src.train_deberta

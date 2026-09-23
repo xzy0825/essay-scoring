@@ -9,28 +9,31 @@ from pathlib import Path
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
+import re
+
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer, get_linear_schedule_with_warmup
 
 from src.metrics import quadratic_weighted_kappa
+from src.splits import inner_fit_eval, outer_folds
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data"
-OUT = ROOT / "outputs" / "deberta"
+OUT = ROOT / "outputs" / "opt" / "deberta"
 SEED = 42
 N_SPLITS = 5
 MODEL_NAME = "microsoft/deberta-v3-small"
-MAX_LENGTH = 512
+MAX_LENGTH = 1024
 EPOCHS = 3
-BATCH_SIZE = 4
-GRAD_ACCUM = 4
+BATCH_SIZE = 2
+GRAD_ACCUM = 8
 LEARNING_RATE = 2e-5
-PREDICT_BATCH = 16
+PREDICT_BATCH = 4
+N_LENGTH_FEATURES = 4
 
 
 def materialize_model(model_name: str) -> str:
@@ -56,6 +59,22 @@ def materialize_model(model_name: str) -> str:
     return str(folder)
 
 
+def length_features(texts: list[str]) -> np.ndarray:
+    rows = []
+    for text in texts:
+        words = text.split()
+        sentences = [part for part in re.split(r"[.!?]+", text) if part.strip()]
+        paragraphs = [part for part in text.split("\n") if part.strip()]
+        rows.append([len(text), len(words), len(sentences), max(len(paragraphs), 1)])
+    return np.log1p(np.asarray(rows, dtype=np.float32))
+
+
+def standardize(reference: np.ndarray, *others: np.ndarray) -> list[np.ndarray]:
+    center = reference.mean(axis=0)
+    scale = np.clip(reference.std(axis=0), 1e-6, None)
+    return [((array - center) / scale).astype(np.float32) for array in (reference, *others)]
+
+
 def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -63,15 +82,19 @@ def set_seed(seed: int) -> None:
 
 
 class EssayDataset(Dataset):
-    def __init__(self, input_ids: list[list[int]], labels: np.ndarray | None = None):
+    def __init__(self, input_ids: list[list[int]], features: np.ndarray, labels: np.ndarray | None = None):
         self.input_ids = input_ids
+        self.features = features
         self.labels = labels
 
     def __len__(self) -> int:
         return len(self.input_ids)
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
-        item = {"input_ids": torch.tensor(self.input_ids[index], dtype=torch.long)}
+        item = {
+            "input_ids": torch.tensor(self.input_ids[index], dtype=torch.long),
+            "features": torch.tensor(self.features[index], dtype=torch.float),
+        }
         if self.labels is not None:
             item["labels"] = torch.tensor(self.labels[index], dtype=torch.float)
         return item
@@ -87,13 +110,14 @@ class EssayRegressor(torch.nn.Module):
         ).float()
         hidden = self.backbone.config.hidden_size
         self.dropout = torch.nn.Dropout(0.1)
-        self.head = torch.nn.Linear(hidden, 1)
+        self.head = torch.nn.Linear(hidden + N_LENGTH_FEATURES, 1)
 
-    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
         hidden = self.backbone(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
         hidden = hidden.float()
         mask = attention_mask.unsqueeze(-1).float()
         pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)
+        pooled = torch.cat([pooled, features.float()], dim=1)
         return self.head(self.dropout(pooled)).squeeze(-1)
 
 
@@ -103,7 +127,11 @@ def collate(batch: list[dict[str, torch.Tensor]], pad_id: int) -> dict[str, torc
         batch_first=True,
         padding_value=pad_id,
     )
-    out = {"input_ids": padded, "attention_mask": (padded != pad_id).long()}
+    out = {
+        "input_ids": padded,
+        "attention_mask": (padded != pad_id).long(),
+        "features": torch.stack([item["features"] for item in batch]),
+    }
     if "labels" in batch[0]:
         out["labels"] = torch.stack([item["labels"] for item in batch])
     return out
@@ -127,8 +155,9 @@ def predict(model, loader, device) -> np.ndarray:
         for batch in loader:
             ids = batch["input_ids"].to(device, non_blocking=True)
             mask = batch["attention_mask"].to(device, non_blocking=True)
+            feats = batch["features"].to(device, non_blocking=True)
             with torch.autocast(device_type="cuda", dtype=torch.float16):
-                pred = model(ids, mask)
+                pred = model(ids, mask, feats)
             preds.append(pred.float().cpu().numpy())
     return np.concatenate(preds)
 
@@ -140,6 +169,7 @@ def train_one_fold(
     y_valid: np.ndarray,
     device: torch.device,
     fold_dir: Path,
+    grad_accum: int,
 ) -> EssayRegressor:
     no_decay = {"bias", "LayerNorm.weight"}
     groups = [
@@ -153,7 +183,7 @@ def train_one_fold(
         },
     ]
     optimizer = torch.optim.AdamW(groups, lr=LEARNING_RATE)
-    updates_per_epoch = max(1, (len(train_loader) + GRAD_ACCUM - 1) // GRAD_ACCUM)
+    updates_per_epoch = max(1, (len(train_loader) + grad_accum - 1) // grad_accum)
     total_steps = updates_per_epoch * EPOCHS
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
@@ -172,13 +202,14 @@ def train_one_fold(
             ids = batch["input_ids"].to(device, non_blocking=True)
             mask = batch["attention_mask"].to(device, non_blocking=True)
             labels = batch["labels"].to(device, non_blocking=True)
+            feats = batch["features"].to(device, non_blocking=True)
             with torch.autocast(device_type="cuda", dtype=torch.float16):
-                pred = model(ids, mask)
-                loss = torch.nn.functional.mse_loss(pred, labels) / GRAD_ACCUM
+                pred = model(ids, mask, feats)
+                loss = torch.nn.functional.mse_loss(pred, labels) / grad_accum
             scaler.scale(loss).backward()
-            running += loss.item() * GRAD_ACCUM * len(labels)
+            running += loss.item() * grad_accum * len(labels)
             seen += len(labels)
-            if step % GRAD_ACCUM == 0 or step == len(train_loader):
+            if step % grad_accum == 0 or step == len(train_loader):
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 scaler.step(optimizer)
@@ -196,45 +227,68 @@ def train_one_fold(
     return model
 
 
-def run_fold(batch_size: int, model_dir: str, tokenizer, train_ids, valid_ids, y_tr, y_va, test_ids, device, fold_path: Path):
+def _loader(ids, features, labels, pad_id: int, batch_size: int, shuffle: bool) -> DataLoader:
+    return DataLoader(
+        EssayDataset(ids, features, labels),
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=0,
+        pin_memory=True,
+        collate_fn=lambda batch: collate(batch, pad_id),
+    )
+
+
+def run_fold(
+    batch_size: int,
+    grad_accum: int,
+    model_dir: str,
+    tokenizer,
+    train_ids,
+    train_features,
+    early_ids,
+    early_features,
+    y_tr,
+    y_early,
+    outer_ids,
+    outer_features,
+    test_ids,
+    test_features,
+    device,
+    fold_path: Path,
+):
     pad_id = tokenizer.pad_token_id
     model = None
     try:
         model = EssayRegressor(model_dir).to(device)
-        train_loader = DataLoader(
-            EssayDataset(train_ids, y_tr),
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=0,
-            pin_memory=True,
-            collate_fn=lambda batch: collate(batch, pad_id),
-        )
-        valid_loader = DataLoader(
-            EssayDataset(valid_ids),
-            batch_size=PREDICT_BATCH,
-            shuffle=False,
-            num_workers=0,
-            pin_memory=True,
-            collate_fn=lambda batch: collate(batch, pad_id),
-        )
-        test_loader = DataLoader(
-            EssayDataset(test_ids),
-            batch_size=PREDICT_BATCH,
-            shuffle=False,
-            num_workers=0,
-            pin_memory=True,
-            collate_fn=lambda batch: collate(batch, pad_id),
-        )
-        model = train_one_fold(model, train_loader, valid_loader, y_va, device, fold_path)
-        oof = predict(model, valid_loader, device)
-        test_pred = predict(model, test_loader, device)
-        return oof, test_pred
+        train_loader = _loader(train_ids, train_features, y_tr, pad_id, batch_size, True)
+        early_loader = _loader(early_ids, early_features, None, pad_id, PREDICT_BATCH, False)
+        outer_loader = _loader(outer_ids, outer_features, None, pad_id, PREDICT_BATCH, False)
+        test_loader = _loader(test_ids, test_features, None, pad_id, PREDICT_BATCH, False)
+        model = train_one_fold(model, train_loader, early_loader, y_early, device, fold_path, grad_accum)
+        return predict(model, outer_loader, device), predict(model, test_loader, device)
     except RuntimeError as exc:
-        if batch_size > 2 and "out of memory" in str(exc).lower():
-            print(f"CUDA OOM at batch {batch_size}, retrying this fold at batch 2")
+        if batch_size > 1 and "out of memory" in str(exc).lower():
+            print(f"CUDA OOM at batch {batch_size}, retrying this fold at batch 1")
             del model
             torch.cuda.empty_cache()
-            return run_fold(2, model_dir, tokenizer, train_ids, valid_ids, y_tr, y_va, test_ids, device, fold_path)
+            return run_fold(
+                1,
+                grad_accum * batch_size,
+                model_dir,
+                tokenizer,
+                train_ids,
+                train_features,
+                early_ids,
+                early_features,
+                y_tr,
+                y_early,
+                outer_ids,
+                outer_features,
+                test_ids,
+                test_features,
+                device,
+                fold_path,
+            )
         raise
 
 
@@ -251,44 +305,74 @@ def main() -> None:
     model_dir = materialize_model(MODEL_NAME)
     tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True, fix_mistral_regex=False)
     print("tokenizing essays")
-    train_ids = encode(tokenizer, train["full_text"].tolist())
-    test_ids = encode(tokenizer, test["full_text"].tolist())
+    train_texts = train["full_text"].tolist()
+    test_texts = test["full_text"].tolist()
+    train_ids = encode(tokenizer, train_texts)
+    test_ids = encode(tokenizer, test_texts)
+    raw_train_features = length_features(train_texts)
+    raw_test_features = length_features(test_texts)
     lengths = [len(ids) for ids in train_ids]
-    print(f"token length min/median/max {min(lengths)} {sorted(lengths)[len(lengths)//2]} {max(lengths)}")
+    capped = sum(length >= MAX_LENGTH for length in lengths)
+    print(
+        f"token length min/median/max {min(lengths)} {sorted(lengths)[len(lengths)//2]} {max(lengths)}"
+        f" capped {capped}"
+    )
 
     oof = np.zeros(len(train), dtype=np.float32)
     test_pred = np.zeros(len(test), dtype=np.float32)
+    fold_ids = np.full(len(train), -1, dtype=np.int8)
     fold_scores: list[float | None] = [None] * N_SPLITS
     progress_path = OUT / "progress.json"
     partial_ready = (OUT / "oof_partial.npy").exists() and (OUT / "test_partial.npy").exists()
     if progress_path.exists() and partial_ready:
         saved = json.loads(progress_path.read_text(encoding="utf-8"))
-        if saved.get("model") == MODEL_NAME and saved.get("max_length") == MAX_LENGTH and saved.get("epochs") == EPOCHS:
+        same_setup = (
+            saved.get("model") == MODEL_NAME
+            and saved.get("max_length") == MAX_LENGTH
+            and saved.get("epochs") == EPOCHS
+            and saved.get("batch_size") == BATCH_SIZE
+        )
+        if same_setup:
             oof = np.load(OUT / "oof_partial.npy")
             test_pred = np.load(OUT / "test_partial.npy")
             fold_scores = saved["fold_qwk_rounded"]
-            print("resuming completed folds", [i + 1 for i, s in enumerate(fold_scores) if s is not None])
+            print("resuming completed folds", [i + 1 for i, score in enumerate(fold_scores) if score is not None])
         else:
             print("checkpoint config changed, training from scratch")
 
-    splitter = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=SEED)
+    folds = outer_folds(y, N_SPLITS, SEED)
+    for fold, (_, va_idx) in enumerate(folds):
+        fold_ids[va_idx] = fold
     started = time.time()
-    for fold, (tr_idx, va_idx) in enumerate(splitter.split(train, y.astype(int))):
+    opt_dir = OUT.parent
+    for fold, (tr_idx, va_idx) in enumerate(folds):
         if fold_scores[fold] is not None:
             continue
         print(f"fold {fold + 1}/{N_SPLITS}")
-        fold_path = OUT / f"fold{fold}.pt"
+        fit_idx, early_idx = inner_fit_eval(tr_idx, y, seed=SEED)
+        fit_features, early_features, outer_features, test_features = standardize(
+            raw_train_features[fit_idx],
+            raw_train_features[early_idx],
+            raw_train_features[va_idx],
+            raw_test_features,
+        )
         oof_fold, test_fold = run_fold(
             BATCH_SIZE,
+            GRAD_ACCUM,
             model_dir,
             tokenizer,
-            [train_ids[i] for i in tr_idx],
+            [train_ids[i] for i in fit_idx],
+            fit_features,
+            [train_ids[i] for i in early_idx],
+            early_features,
+            y[fit_idx],
+            y[early_idx],
             [train_ids[i] for i in va_idx],
-            y[tr_idx],
-            y[va_idx],
+            outer_features,
             test_ids,
+            test_features,
             device,
-            fold_path,
+            OUT / f"fold{fold}.pt",
         )
         oof[va_idx] = oof_fold
         test_pred += test_fold / N_SPLITS
@@ -303,6 +387,7 @@ def main() -> None:
                     "model": MODEL_NAME,
                     "max_length": MAX_LENGTH,
                     "epochs": EPOCHS,
+                    "batch_size": BATCH_SIZE,
                     "fold_qwk_rounded": fold_scores,
                 }
             ),
@@ -312,8 +397,9 @@ def main() -> None:
 
     oof_score = quadratic_weighted_kappa(y, oof)
     print(f"OOF QWK {oof_score:.5f}")
-    np.save(ROOT / "outputs" / "oof_deberta.npy", oof)
-    np.save(ROOT / "outputs" / "test_deberta.npy", test_pred)
+    np.save(opt_dir / "oof_deberta.npy", oof)
+    np.save(opt_dir / "test_deberta.npy", test_pred)
+    np.save(opt_dir / "fold_ids.npy", fold_ids)
     report = {
         "model": MODEL_NAME,
         "max_length": MAX_LENGTH,
@@ -325,9 +411,10 @@ def main() -> None:
         "seed": SEED,
         "fold_qwk_rounded": fold_scores,
         "oof_qwk_rounded": oof_score,
+        "capped_essays": capped,
         "seconds": round(time.time() - started, 1),
     }
-    (ROOT / "outputs" / "deberta_cv.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    (opt_dir / "deberta_cv.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(f"finished in {report['seconds']}s")
 
 

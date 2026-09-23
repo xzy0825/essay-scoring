@@ -12,13 +12,13 @@ import numpy as np
 import pandas as pd
 from scipy import sparse
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.model_selection import StratifiedKFold
 
 from src.metrics import quadratic_weighted_kappa
+from src.splits import inner_fit_eval, outer_folds
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data"
-OUT = ROOT / "outputs"
+OUT = ROOT / "outputs" / "opt"
 SEED = 42
 N_SPLITS = 5
 
@@ -81,18 +81,14 @@ def main() -> None:
     y = train["score"].to_numpy(dtype=np.float32)
     oof = np.zeros(len(train), dtype=np.float32)
     test_pred = np.zeros(len(test), dtype=np.float32)
+    fold_ids = np.full(len(train), -1, dtype=np.int8)
     fold_scores: list[float] = []
 
-    splitter = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=SEED)
-    for fold, (tr_idx, va_idx) in enumerate(splitter.split(train, y.astype(int)), start=1):
-        word, char = make_vectorizers()
-        x_tr = transform(word, char, train.loc[tr_idx, "full_text"], fit=True)
-        x_va = transform(word, char, train.loc[va_idx, "full_text"], fit=False)
-        x_te = transform(word, char, test["full_text"], fit=False)
-        model = lgb.LGBMRegressor(
+    def make_model(n_estimators: int) -> lgb.LGBMRegressor:
+        return lgb.LGBMRegressor(
             objective="regression",
             learning_rate=0.05,
-            n_estimators=3000,
+            n_estimators=n_estimators,
             num_leaves=64,
             subsample=0.8,
             colsample_bytree=0.8,
@@ -103,23 +99,39 @@ def main() -> None:
             force_col_wise=True,
             verbosity=-1,
         )
-        model.fit(
-            x_tr,
-            y[tr_idx],
-            eval_X=x_va,
-            eval_y=y[va_idx],
+
+    for fold, (tr_idx, va_idx) in enumerate(outer_folds(y, N_SPLITS, SEED)):
+        fold_ids[va_idx] = fold
+        fit_idx, early_idx = inner_fit_eval(tr_idx, y, seed=SEED)
+        word, char = make_vectorizers()
+        x_fit = transform(word, char, train.loc[fit_idx, "full_text"], fit=True)
+        x_early = transform(word, char, train.loc[early_idx, "full_text"], fit=False)
+        probe = make_model(3000)
+        probe.fit(
+            x_fit,
+            y[fit_idx],
+            eval_X=x_early,
+            eval_y=y[early_idx],
             callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(0)],
         )
+        n_trees = max(int(probe.best_iteration_), 50)
+        word, char = make_vectorizers()
+        x_tr = transform(word, char, train.loc[tr_idx, "full_text"], fit=True)
+        x_va = transform(word, char, train.loc[va_idx, "full_text"], fit=False)
+        x_te = transform(word, char, test["full_text"], fit=False)
+        model = make_model(n_trees)
+        model.fit(x_tr, y[tr_idx])
         oof[va_idx] = model.predict(x_va)
         test_pred += model.predict(x_te) / N_SPLITS
         score = quadratic_weighted_kappa(y[va_idx], oof[va_idx])
         fold_scores.append(score)
-        print(f"fold {fold} QWK {score:.5f} best_iter {model.best_iteration_}")
+        print(f"fold {fold + 1} QWK {score:.5f} trees {n_trees}")
 
     oof_score = quadratic_weighted_kappa(y, oof)
     print(f"OOF QWK {oof_score:.5f}")
     np.save(OUT / "oof_lgbm.npy", oof)
     np.save(OUT / "test_lgbm.npy", test_pred)
+    np.save(OUT / "fold_ids.npy", fold_ids)
     report = {
         "model": "tfidf_lightgbm",
         "n_splits": N_SPLITS,

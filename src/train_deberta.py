@@ -23,17 +23,19 @@ from src.splits import inner_fit_eval, outer_folds
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data"
-OUT = ROOT / "outputs" / "opt" / "deberta"
+OUT = ROOT / os.environ.get("AES_OUT", "outputs/opt/deberta")
+STEM = os.environ.get("AES_STEM", "deberta")
 SEED = 42
 N_SPLITS = 5
-MODEL_NAME = "microsoft/deberta-v3-small"
-MAX_LENGTH = 1024
+MODEL_NAME = os.environ.get("AES_MODEL", "microsoft/deberta-v3-small")
+MAX_LENGTH = int(os.environ.get("AES_MAX_LENGTH", "1024"))
 EPOCHS = 3
-BATCH_SIZE = 2
-GRAD_ACCUM = 8
+BATCH_SIZE = int(os.environ.get("AES_BATCH", "2"))
+GRAD_ACCUM = int(os.environ.get("AES_GRAD_ACCUM", "8"))
 LEARNING_RATE = 2e-5
-PREDICT_BATCH = 4
+PREDICT_BATCH = int(os.environ.get("AES_PREDICT_BATCH", "4"))
 N_LENGTH_FEATURES = 4
+CHECKPOINT = os.environ.get("AES_CHECKPOINT", "0") == "1"
 
 
 def materialize_model(model_name: str) -> str:
@@ -108,6 +110,8 @@ class EssayRegressor(torch.nn.Module):
             use_safetensors=True,
             local_files_only=True,
         ).float()
+        if CHECKPOINT:
+            self.backbone.gradient_checkpointing_enable()
         hidden = self.backbone.config.hidden_size
         self.dropout = torch.nn.Dropout(0.1)
         self.head = torch.nn.Linear(hidden + N_LENGTH_FEATURES, 1)
@@ -397,8 +401,8 @@ def main() -> None:
 
     oof_score = quadratic_weighted_kappa(y, oof)
     print(f"OOF QWK {oof_score:.5f}")
-    np.save(opt_dir / "oof_deberta.npy", oof)
-    np.save(opt_dir / "test_deberta.npy", test_pred)
+    np.save(opt_dir / f"oof_{STEM}.npy", oof)
+    np.save(opt_dir / f"test_{STEM}.npy", test_pred)
     np.save(opt_dir / "fold_ids.npy", fold_ids)
     report = {
         "model": MODEL_NAME,
@@ -414,7 +418,7 @@ def main() -> None:
         "capped_essays": capped,
         "seconds": round(time.time() - started, 1),
     }
-    (opt_dir / "deberta_cv.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    (opt_dir / f"{STEM}_cv.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(f"finished in {report['seconds']}s")
 
 

@@ -1,4 +1,9 @@
-"""5-fold DeBERTa-v3-small regression for essay scores."""
+"""5-fold DeBERTa regression or 6-class scoring for essays.
+
+Defaults match the small model used in the best blend: MSE, max length 1024,
+no prompt features. The base model and the 6-class run set AES_MODEL, AES_HEAD,
+AES_PROMPT, AES_LLRD, AES_OUT, and AES_STEM. See README.
+"""
 
 from __future__ import annotations
 
@@ -19,6 +24,7 @@ from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer, get_linear_schedule_with_warmup
 
 from src.metrics import quadratic_weighted_kappa
+from src.prompts import RULES, assign_prompts
 from src.splits import inner_fit_eval, outer_folds
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,6 +42,11 @@ LEARNING_RATE = 2e-5
 PREDICT_BATCH = int(os.environ.get("AES_PREDICT_BATCH", "4"))
 N_LENGTH_FEATURES = 4
 CHECKPOINT = os.environ.get("AES_CHECKPOINT", "0") == "1"
+HEAD = os.environ.get("AES_HEAD", "mse")
+USE_PROMPT = os.environ.get("AES_PROMPT", "0") == "1"
+LLRD = float(os.environ.get("AES_LLRD", "0") or 0)
+PROMPT_NAMES = [name for name, _ in RULES] + ["unknown"]
+N_OUT = 6 if HEAD == "cls" else 1
 
 
 def materialize_model(model_name: str) -> str:
@@ -77,6 +88,27 @@ def standardize(reference: np.ndarray, *others: np.ndarray) -> list[np.ndarray]:
     return [((array - center) / scale).astype(np.float32) for array in (reference, *others)]
 
 
+def prompt_one_hot(texts) -> np.ndarray:
+    index = {name: i for i, name in enumerate(PROMPT_NAMES)}
+    rows = np.zeros((len(texts), len(PROMPT_NAMES)), dtype=np.float32)
+    for row, name in enumerate(assign_prompts(texts)):
+        rows[row, index[name]] = 1.0
+    return rows
+
+
+def with_prompt(features: np.ndarray, texts) -> np.ndarray:
+    if not USE_PROMPT:
+        return features
+    return np.hstack([features, prompt_one_hot(texts)]).astype(np.float32)
+
+
+def class_weights(labels: np.ndarray, device: torch.device) -> torch.Tensor:
+    counts = np.bincount(np.asarray(labels).astype(int), minlength=7)[1:7].astype(np.float64)
+    weights = np.sqrt(counts.mean() / np.clip(counts, 1.0, None))
+    weights = weights / weights.mean()
+    return torch.tensor(weights, dtype=torch.float32, device=device)
+
+
 def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -103,8 +135,9 @@ class EssayDataset(Dataset):
 
 
 class EssayRegressor(torch.nn.Module):
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, n_features: int = N_LENGTH_FEATURES, n_out: int = 1):
         super().__init__()
+        self.n_out = n_out
         self.backbone = AutoModel.from_pretrained(
             model_name,
             use_safetensors=True,
@@ -114,7 +147,7 @@ class EssayRegressor(torch.nn.Module):
             self.backbone.gradient_checkpointing_enable()
         hidden = self.backbone.config.hidden_size
         self.dropout = torch.nn.Dropout(0.1)
-        self.head = torch.nn.Linear(hidden + N_LENGTH_FEATURES, 1)
+        self.head = torch.nn.Linear(hidden + n_features, n_out)
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
         hidden = self.backbone(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
@@ -122,7 +155,10 @@ class EssayRegressor(torch.nn.Module):
         mask = attention_mask.unsqueeze(-1).float()
         pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)
         pooled = torch.cat([pooled, features.float()], dim=1)
-        return self.head(self.dropout(pooled)).squeeze(-1)
+        out = self.head(self.dropout(pooled))
+        if self.n_out == 1:
+            return out.squeeze(-1)
+        return out
 
 
 def collate(batch: list[dict[str, torch.Tensor]], pad_id: int) -> dict[str, torch.Tensor]:
@@ -161,9 +197,43 @@ def predict(model, loader, device) -> np.ndarray:
             mask = batch["attention_mask"].to(device, non_blocking=True)
             feats = batch["features"].to(device, non_blocking=True)
             with torch.autocast(device_type="cuda", dtype=torch.float16):
-                pred = model(ids, mask, feats)
-            preds.append(pred.float().cpu().numpy())
+                raw = model(ids, mask, feats)
+            raw = raw.float()
+            if raw.ndim == 1:
+                pred = raw
+            else:
+                values = torch.arange(1, raw.shape[-1] + 1, device=raw.device, dtype=raw.dtype)
+                pred = (torch.softmax(raw, dim=-1) * values).sum(dim=-1)
+            preds.append(pred.cpu().numpy())
     return np.concatenate(preds)
+
+
+def optimizer_groups(model: EssayRegressor) -> list[dict]:
+    no_decay_keys = ("bias", "LayerNorm.weight")
+    n_layers = model.backbone.config.num_hidden_layers
+    buckets: dict[tuple[float, bool], list] = {}
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        skip_decay = any(key in name for key in no_decay_keys)
+        if not LLRD or name.startswith("head"):
+            scale = 1.0
+        else:
+            match = re.search(r"encoder\.layer\.(\d+)", name)
+            if match:
+                index = int(match.group(1))
+                scale = LLRD ** (n_layers - 1 - index)
+            else:
+                scale = LLRD ** n_layers
+        buckets.setdefault((round(scale, 6), skip_decay), []).append(param)
+    return [
+        {
+            "params": params,
+            "lr": LEARNING_RATE * scale,
+            "weight_decay": 0.0 if skip_decay else 0.01,
+        }
+        for (scale, skip_decay), params in buckets.items()
+    ]
 
 
 def train_one_fold(
@@ -174,19 +244,13 @@ def train_one_fold(
     device: torch.device,
     fold_dir: Path,
     grad_accum: int,
+    y_train: np.ndarray,
 ) -> EssayRegressor:
-    no_decay = {"bias", "LayerNorm.weight"}
-    groups = [
-        {
-            "params": [p for n, p in model.named_parameters() if p.requires_grad and not any(k in n for k in no_decay)],
-            "weight_decay": 0.01,
-        },
-        {
-            "params": [p for n, p in model.named_parameters() if p.requires_grad and any(k in n for k in no_decay)],
-            "weight_decay": 0.0,
-        },
-    ]
-    optimizer = torch.optim.AdamW(groups, lr=LEARNING_RATE)
+    groups = optimizer_groups(model)
+    scales = sorted({group["lr"] for group in groups})
+    print(f"  lr {scales[0]:.3e} .. {scales[-1]:.3e} across {len(groups)} groups")
+    optimizer = torch.optim.AdamW(groups)
+    class_weight = class_weights(y_train, device) if HEAD == "cls" else None
     updates_per_epoch = max(1, (len(train_loader) + grad_accum - 1) // grad_accum)
     total_steps = updates_per_epoch * EPOCHS
     scheduler = get_linear_schedule_with_warmup(
@@ -209,7 +273,10 @@ def train_one_fold(
             feats = batch["features"].to(device, non_blocking=True)
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 pred = model(ids, mask, feats)
-                loss = torch.nn.functional.mse_loss(pred, labels) / grad_accum
+                if HEAD == "cls":
+                    loss = torch.nn.functional.cross_entropy(pred, labels.long() - 1, weight=class_weight) / grad_accum
+                else:
+                    loss = torch.nn.functional.mse_loss(pred, labels) / grad_accum
             scaler.scale(loss).backward()
             running += loss.item() * grad_accum * len(labels)
             seen += len(labels)
@@ -222,7 +289,7 @@ def train_one_fold(
                 scheduler.step()
         val_pred = predict(model, valid_loader, device)
         qwk = quadratic_weighted_kappa(y_valid, val_pred)
-        print(f"  epoch {epoch} train_mse {running / max(seen, 1):.4f} val_qwk {qwk:.5f}")
+        print(f"  epoch {epoch} train_loss {running / max(seen, 1):.4f} val_qwk {qwk:.5f}")
         if qwk >= best_qwk:
             best_qwk = qwk
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
@@ -263,12 +330,15 @@ def run_fold(
     pad_id = tokenizer.pad_token_id
     model = None
     try:
-        model = EssayRegressor(model_dir).to(device)
+        n_features = int(train_features.shape[1])
+        model = EssayRegressor(model_dir, n_features=n_features, n_out=N_OUT).to(device)
         train_loader = _loader(train_ids, train_features, y_tr, pad_id, batch_size, True)
         early_loader = _loader(early_ids, early_features, None, pad_id, PREDICT_BATCH, False)
         outer_loader = _loader(outer_ids, outer_features, None, pad_id, PREDICT_BATCH, False)
         test_loader = _loader(test_ids, test_features, None, pad_id, PREDICT_BATCH, False)
-        model = train_one_fold(model, train_loader, early_loader, y_early, device, fold_path, grad_accum)
+        model = train_one_fold(
+            model, train_loader, early_loader, y_early, device, fold_path, grad_accum, y_tr
+        )
         return predict(model, outer_loader, device), predict(model, test_loader, device)
     except RuntimeError as exc:
         if batch_size > 1 and "out of memory" in str(exc).lower():
@@ -335,6 +405,9 @@ def main() -> None:
             and saved.get("max_length") == MAX_LENGTH
             and saved.get("epochs") == EPOCHS
             and saved.get("batch_size") == BATCH_SIZE
+            and saved.get("head", "mse") == HEAD
+            and saved.get("prompt", False) == USE_PROMPT
+            and saved.get("llrd", 0) == LLRD
         )
         if same_setup:
             oof = np.load(OUT / "oof_partial.npy")
@@ -360,6 +433,10 @@ def main() -> None:
             raw_train_features[va_idx],
             raw_test_features,
         )
+        fit_features = with_prompt(fit_features, [train_texts[i] for i in fit_idx])
+        early_features = with_prompt(early_features, [train_texts[i] for i in early_idx])
+        outer_features = with_prompt(outer_features, [train_texts[i] for i in va_idx])
+        test_features = with_prompt(test_features, test_texts)
         oof_fold, test_fold = run_fold(
             BATCH_SIZE,
             GRAD_ACCUM,
@@ -392,6 +469,9 @@ def main() -> None:
                     "max_length": MAX_LENGTH,
                     "epochs": EPOCHS,
                     "batch_size": BATCH_SIZE,
+                    "head": HEAD,
+                    "prompt": USE_PROMPT,
+                    "llrd": LLRD,
                     "fold_qwk_rounded": fold_scores,
                 }
             ),
@@ -411,6 +491,9 @@ def main() -> None:
         "batch_size": BATCH_SIZE,
         "grad_accum": GRAD_ACCUM,
         "learning_rate": LEARNING_RATE,
+        "head": HEAD,
+        "prompt": USE_PROMPT,
+        "llrd": LLRD,
         "n_splits": N_SPLITS,
         "seed": SEED,
         "fold_qwk_rounded": fold_scores,

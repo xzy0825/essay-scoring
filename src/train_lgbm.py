@@ -1,10 +1,16 @@
-"""Stratified 5-fold TF-IDF + LightGBM regression baseline."""
+"""Stratified 5-fold TF-IDF + LightGBM with spelling, connectives, and prompt.
+
+Writes outputs/opt/oof_lgbm_rich.npy. The best blend also uses the earlier
+LightGBM in outputs/oof_lgbm.npy, trained on the main branch with basic length
+features and early stopping on the outer fold.
+"""
 
 from __future__ import annotations
 
 import json
 import re
 import time
+from collections import Counter
 from pathlib import Path
 
 import lightgbm as lgb
@@ -14,6 +20,7 @@ from scipy import sparse
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 from src.metrics import quadratic_weighted_kappa
+from src.prompts import RULES, assign_prompts
 from src.splits import inner_fit_eval, outer_folds
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,14 +30,79 @@ SEED = 42
 N_SPLITS = 5
 
 
+_TOKEN = re.compile(r"[A-Za-z]+")
+_REPEAT = re.compile(r"(.)\1\1")
+_PROMPT_NAMES = [name for name, _ in RULES] + ["unknown"]
+_PHRASES = (
+    "for example",
+    "for instance",
+    "in addition",
+    "in conclusion",
+    "on the other hand",
+    "as a result",
+    "in contrast",
+    "for this reason",
+)
+_WORD_GROUPS = (
+    ("however", "although", "though", "despite", "whereas", "nevertheless", "nonetheless"),
+    ("because", "therefore", "thus", "hence", "consequently"),
+    ("furthermore", "moreover", "additionally"),
+    ("finally", "overall", "lastly"),
+)
+_VOCAB: set[str] | None = None
+
+
+def _vocab() -> set[str]:
+    global _VOCAB
+    if _VOCAB is None:
+        raw = Path("/usr/share/dict/words").read_text(encoding="utf-8", errors="ignore").split()
+        words = {word.lower() for word in raw if word.isalpha()}
+        for _, keys in RULES:
+            for key in keys:
+                words.update(_TOKEN.findall(key.lower()))
+        _VOCAB = words
+    return _VOCAB
+
+
 def hand_features(texts: pd.Series) -> np.ndarray:
+    vocab = _vocab()
+    prompts = assign_prompts(texts)
     rows = []
-    for text in texts:
+    for text, prompt in zip(texts, prompts):
         words = text.split()
+        tokens = _TOKEN.findall(text.lower())
+        n_tok = max(len(tokens), 1)
         sentences = [part for part in re.split(r"[.!?]+", text) if part.strip()]
         paragraphs = [part for part in text.split("\n") if part.strip()]
+        para_lens = [len(part.split()) for part in paragraphs] or [0]
+        n_sent = max(len(sentences), 1)
+        n_para = max(len(paragraphs), 1)
+        counts = Counter(tokens)
+        lowered = text.lower()
+        oov = sum(1 for token in tokens if len(token) > 2 and token not in vocab)
+        repeated = sum(1 for token in tokens if _REPEAT.search(token))
+        phrase_hits = sum(lowered.count(phrase) for phrase in _PHRASES)
+        group_rates = [sum(counts[word] for word in group) / n_tok for group in _WORD_GROUPS]
         avg_word = float(np.mean([len(word) for word in words])) if words else 0.0
-        rows.append([len(text), len(words), len(sentences), len(paragraphs), avg_word])
+        row = [
+            len(text),
+            len(words),
+            len(sentences),
+            len(paragraphs),
+            avg_word,
+            oov / n_tok,
+            repeated / n_tok,
+            text.count("?") / n_sent,
+            text.count(",") / n_tok,
+            len(counts) / n_tok,
+            float(np.std(para_lens)),
+            sum(1 for length in para_lens if length < 20) / n_para,
+            float(np.mean(para_lens)),
+            phrase_hits / n_tok,
+            *group_rates,
+        ]
+        row.extend(float(prompt == name) for name in _PROMPT_NAMES)
+        rows.append(row)
     return np.asarray(rows, dtype=np.float32)
 
 
@@ -81,7 +153,6 @@ def main() -> None:
     y = train["score"].to_numpy(dtype=np.float32)
     oof = np.zeros(len(train), dtype=np.float32)
     test_pred = np.zeros(len(test), dtype=np.float32)
-    fold_ids = np.full(len(train), -1, dtype=np.int8)
     fold_scores: list[float] = []
 
     def make_model(n_estimators: int) -> lgb.LGBMRegressor:
@@ -101,7 +172,6 @@ def main() -> None:
         )
 
     for fold, (tr_idx, va_idx) in enumerate(outer_folds(y, N_SPLITS, SEED)):
-        fold_ids[va_idx] = fold
         fit_idx, early_idx = inner_fit_eval(tr_idx, y, seed=SEED)
         word, char = make_vectorizers()
         x_fit = transform(word, char, train.loc[fit_idx, "full_text"], fit=True)
@@ -129,27 +199,18 @@ def main() -> None:
 
     oof_score = quadratic_weighted_kappa(y, oof)
     print(f"OOF QWK {oof_score:.5f}")
-    np.save(OUT / "oof_lgbm.npy", oof)
-    np.save(OUT / "test_lgbm.npy", test_pred)
-    np.save(OUT / "fold_ids.npy", fold_ids)
+    np.save(OUT / "oof_lgbm_rich.npy", oof)
+    np.save(OUT / "test_lgbm_rich.npy", test_pred)
     report = {
-        "model": "tfidf_lightgbm",
+        "model": "tfidf_lightgbm_rich",
         "n_splits": N_SPLITS,
         "seed": SEED,
         "fold_qwk_rounded": fold_scores,
         "oof_qwk_rounded": oof_score,
         "seconds": round(time.time() - started, 1),
     }
-    (OUT / "lgbm_cv.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-
-    submission = pd.DataFrame(
-        {
-            "essay_id": test["essay_id"],
-            "score": np.clip(np.rint(test_pred), 1, 6).astype(int),
-        }
-    )
-    submission.to_csv(OUT / "submission.csv", index=False)
-    print(f"wrote {OUT / 'submission.csv'} in {report['seconds']}s")
+    (OUT / "lgbm_rich_cv.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print(f"wrote rich LightGBM predictions in {report['seconds']}s")
 
 
 if __name__ == "__main__":
